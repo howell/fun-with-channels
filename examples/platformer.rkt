@@ -67,10 +67,10 @@
 ;; game-logic process
 (struct make-env (r) #:transparent)
 
-;; an Enemy is (enemy Id (Channelof GameEvent) Rect), representing the identity,
+;; an Enemy is (enemy Id Rect (Channelof GameEvent)), representing the identity,
 ;; a channel the game logic will use to notify the enemy of relevant events,
 ;; location, and shape of an enemy
-(struct enemy (id chan rect) #:transparent)
+(struct enemy (id rect chan) #:transparent)
 
 ;; Enemies come into being by sending (make-enemy Id (Channelof GameEvent) Rect)
 ;; to the game-logic process. (death) is sent on the channel if the player kills
@@ -88,6 +88,7 @@
 ;;  'defeat
 
 ;; (Channelof LevelOver)
+;; (Channelof Any)
 ;; (Channelof TickSuscription)
 ;; (Channelof RenderGamestate)
 ;; Rect
@@ -95,6 +96,7 @@
 ;; Posn
 ;;  -> (Channelof MoveRequest)
 (define (start-game-logic level-over-chan
+                          kill-player-chan
                           clock-chan
                           render-chan
                           player0
@@ -105,13 +107,14 @@
    (thunk
     (define clock-ticks (make-channel))
     (define unsub-timer (make-channel))
-    (channel-put clock-chan (tick-subscription clock-ticks unsub-timer))
+    (channel-put clock-chan (tick-subscription 'game-logic clock-ticks unsub-timer))
     ;; LevelOver (Listof Enemey) -> Void
     (define (shutdown! reason enemies)
+      (channel-put kill-player-chan 'DDDDDIEEEE!)
       (channel-put unsub-timer (unsubscribe))
       (for ([e (in-list enemies)])
         (channel-put (enemy-chan e) reason))
-      (channel-put level-over-chan 'level-over))
+      (channel-put level-over-chan reason))
     (let loop ([gs (game-state player0 '() goal0 (hash) level-size)])
       (sync (handle-evt
              clock-ticks
@@ -143,7 +146,7 @@
                   [done
                    (shutdown! done (hash-values (game-state-enemies gs)))])]
                [(move-y id dy resp-chan)
-                (match (enemy-motion-y gs id dy)
+                (match (enemy-motion-y gs id dy resp-chan)
                   [(? game-state? next-gs)
                    (loop next-gs)]
                   [done
@@ -157,8 +160,8 @@
                     (channel-put resp-chan (can-jump))
                     (channel-put resp-chan (cannot-jump)))
                 (loop gs)]
-               [(make-enemy id pid r)
-                (loop (add-enemy gs id pid r))]
+               [(make-enemy id chan r)
+                (loop (add-enemy gs id chan r))]
                [(make-env r)
                 (define new-env (cons r (game-state-env gs)))
                 (define next-state (struct-copy game-state gs [env new-env]))
@@ -209,7 +212,7 @@
     [else
      (if col?
          (channel-put resp-chan (y-collision))
-         'ok)
+         (channel-put resp-chan 'ok))
      (for ([e (in-list col-enemies)])
        (channel-put (enemy-chan e) (death)))
      (game-state player-n env-old cur-goal enemies-new lsize)]))
@@ -239,13 +242,13 @@
   ;; the enemy might not be in the hash if it was recently killed
   (cond
     [maybe-enemy
-     (match-define (enemy _  pid e-rect) maybe-enemy)
+     (match-define (enemy _  e-rect e-chan) maybe-enemy)
      (define e-rect-new (car (move-player-x e-rect dx env-old)))
      (cond
        [(overlapping-rects? player-old e-rect-new)
         'defeat]
        [else
-        (define enemies-new (hash-set enemies-old id (enemy id pid e-rect-new)))
+        (define enemies-new (hash-set enemies-old id (enemy id e-rect-new e-chan)))
         (game-state player-old env-old cur-goal enemies-new lsize)])]
     [else gs]))
 
@@ -305,12 +308,15 @@
    (thunk
     (define timer-ticks (make-channel))
     (define unsub-timer (make-channel))
-    (channel-put game-clock (tick-subscription timer-ticks unsub-timer))
+    (channel-put game-clock (tick-subscription 'player timer-ticks unsub-timer))
     (define key-events (make-channel))
     (define unsub-keyboard (make-channel))
     (channel-put keyboard-driver
                  (keyboard-subscription key-events unsub-keyboard))
     (define move-response (make-channel))
+    (define (shutdown!)
+      (channel-put unsub-timer (unsubscribe))
+      (channel-put unsub-keyboard (unsubscribe)))
     (let loop ([left-down? #f]
                [right-down? #f]
                [vy 0])
@@ -318,29 +324,48 @@
        (handle-evt
         kill-player
         (lambda (k)
-          (channel-put unsub-timer (unsubscribe))
-          (channel-put unsub-keyboard (unsubscribe))))
+          (shutdown!)))
        (handle-evt
         timer-ticks
         (lambda (t)
           (define vx (- (if right-down? dx 0)
                         (if left-down? dx 0)))
-          (channel-put game-logic (move-x player-id vx move-response))
-          (channel-get move-response)
-          (channel-put game-logic (move-y player-id vy move-response))
-          (define vy-new
-            (match (channel-get move-response)
-              [(y-collision) 0]
-              [_ (min (+ vy gravity) EFFECTIVE-TERMINAL-VELOCITY)]))
-          (loop left-down? right-down? vy-new)))
+          (sync
+           (handle-evt
+            kill-player
+            (lambda (k) (shutdown!)))
+           (handle-evt
+            (channel-put-evt
+             game-logic
+             (move-x player-id vx move-response))
+            (lambda (_)
+              (channel-get move-response)
+              (sync
+               (handle-evt
+                kill-player
+                (lambda (k) (shutdown!)))
+               (handle-evt
+                (channel-put-evt game-logic (move-y player-id vy move-response))
+                (lambda (_)
+                  (define vy-new
+                    (match (channel-get move-response)
+                      [(y-collision) 0]
+                      [_ (min (+ vy gravity) EFFECTIVE-TERMINAL-VELOCITY)]))
+                  (loop left-down? right-down? vy-new)))))))))
        (handle-evt
         key-events
         (match-lambda
           [(key-press #\space)
-           (channel-put game-logic (player-can-jump? move-response))
-           (match (channel-get move-response)
-             [(can-jump) (loop left-down? right-down? jump-v)]
-             [(cannot-jump) (loop left-down? right-down? vy)])]
+           (sync
+               (handle-evt
+                kill-player
+                (lambda (k) (shutdown!)))
+               (handle-evt
+                (channel-put-evt game-logic (player-can-jump? move-response))
+                (lambda (_)
+                  (match (channel-get move-response)
+                    [(can-jump) (loop left-down? right-down? jump-v)]
+                    [(cannot-jump) (loop left-down? right-down? vy)]))))]
           [(key-press 'left)
            (loop #t right-down? vy)]
           [(key-release 'left)
@@ -381,14 +406,15 @@
     (let loop ([levels levels])
       (match-define (cons level1 next-levels) levels)
       (let run-current ()
+        (define kill-player (make-channel))
         (define game-logic
           (start-game-logic level-over
+                            kill-player
                             game-clock
                             renderer
                             (level-player0 level1)
                             (level-goal level1)
                             (level-size level1)))
-        (define kill-player (make-channel))
         (define player
           (start-player-avatar keyboard-driver
                                game-logic
@@ -396,7 +422,6 @@
                                kill-player))
         (load-level! level1 game-logic game-clock)
         (define over (channel-get level-over))
-        (channel-put kill-player 'die-you-devil)
         (match over
           ['defeat
            (run-current)]
@@ -419,11 +444,12 @@
 
 ;; a Tick is a (tick) signifying a tick of the game clock
 ;; a TickSubscription is a
-;;  (tick-subscription (Channelof Tick) (Channelof Unsubscribe))
+;;  (tick-subscription Any (Channelof Tick) (Channelof Unsubscribe))
+;; the first field is a name to associate with the subscription for debugging
 ;; informing the game clock a Tick along the first channel for every timer
 ;; tick until an Unsubscribe is sent along the second channel
 (struct tick () #:transparent)
-(struct tick-subscription (notify-chan unsub-chan) #:transparent)
+(struct tick-subscription (name notify-chan unsub-chan) #:transparent)
 
 ;; (Channelof SetTimer) Ms -> (Channelof TickSuscription)
 (define (start-game-clock timer-chan frame-period-ms)
@@ -433,27 +459,26 @@
     (define timer-elapsed-chan (make-channel))
     (define begin (current-inexact-milliseconds))
     
-    ;; subscribers : (Listof (Cons (Channelof Tick) (Channelof Unsubscribe)))
+    ;; subscribers : (Listof (List Any (Channelof Tick) (Channelof Unsubscribe)))
     (let loop ([subscribers '()]
                [now begin])
       (channel-put timer-chan
                    (set-timer (+ now frame-period-ms) timer-elapsed-chan))
       ;; wait for the timer to tick
       (channel-get timer-elapsed-chan)
-      (printf "timer tick\n")
       ;; check for new subscribers
       (define more-subscribers
         (let new-sub-loop ([new-subs '()])
           (match (channel-try-get request-chan)
-            [(tick-subscription notify-chan unsub-chan)
-             (new-sub-loop (cons (cons notify-chan unsub-chan) new-subs))]
+            [(tick-subscription name notify-chan unsub-chan)
+             (new-sub-loop (cons (list name notify-chan unsub-chan) new-subs))]
             [_ new-subs])))
       ;; notify and/or unsubscribe all subscribers
       (define new-subscribers
         (for/fold ([subs '()])
                   ([chans (sequence-append (in-list subscribers)
                                            (in-list more-subscribers))])
-          (match-define (cons notify-chan unsub-chan) chans)
+          (match-define (list name notify-chan unsub-chan) chans)
           (sync (handle-evt (channel-put-evt notify-chan (tick))
                             (lambda (e) (cons chans subs)))
                 (handle-evt unsub-chan
@@ -524,7 +549,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Enemies
 
-;; Number Number Number Number (Natural Id -> Void) -> PID
+;; Number Number Number Number (Natural Id (Channelof GameEvent) -> Boolean) -> PID
 (define (start-enemy game-logic game-clock x0 y0 w h behavior)
   (define id (gensym 'enemy))
   (thread
@@ -532,18 +557,19 @@
     (define clock-tick (make-channel))
     (define unsub-timer (make-channel))
     (define game-event (make-channel))
-    (channel-put game-clock (tick-subscription clock-tick unsub-timer))
-    (channel-put game-logic (make-enemy id game-event (rect (posn x0 y0) w h)))
+    (channel-put game-clock (tick-subscription id clock-tick unsub-timer))
+    (channel-put game-logic (make-enemy id (rect (posn x0 y0) w h) game-event))
     (let loop ([n 0])
       (sync
        (handle-evt
         clock-tick
         (lambda (t)
-          (behavior n id)
-          (loop (add1 n))))
+          (if (behavior n id game-event)
+              (loop (add1 n))
+              (channel-put unsub-timer (unsubscribe)))))
        (handle-evt
         game-event
-        (lambda (e)
+        (lambda (_)
           (channel-put unsub-timer (unsubscribe)))))))))
 
 ;; spawn an enemy that travels from (x0, y0) to (x0 + x-dist, y0) then back to
@@ -554,12 +580,20 @@
   (define move-response (make-channel))
   (start-enemy game-logic game-clock
                x0 y0 w h
-               (lambda (n id)
+               (lambda (n id game-event)
                  (define right? (< (modulo n (floor (* 2 THRESHOLD)))
                                    THRESHOLD))
                  (define motion (if right? dx (- dx)))
-                 (channel-put game-logic (move-x id motion move-response))
-                 (channel-get move-response))))
+                 (sync
+                  (handle-evt
+                   (channel-put-evt game-logic (move-x id motion move-response))
+                   (lambda (_)
+                     (channel-get move-response)
+                     'continue))
+                  (handle-evt
+                   game-event
+                   (lambda (_)
+                     #f))))))
 
 ;; spawn an enemy that travels from (x0, y0) to (x0, y0 + y-dist) then back to
 ;; (x0, y0) at a rate of dy per clock tick
@@ -569,11 +603,18 @@
   (define move-response (make-channel))
   (start-enemy game-logic game-clock
                x0 y0 w h
-               (lambda (n id)
+               (lambda (n id game-event)
                  (define up? (< (modulo n (floor (* 2 THRESHOLD))) THRESHOLD))
                  (define motion (if up? dy (- dy)))
-                 (channel-put game-logic (move-y id motion move-response))
-                 (channel-get move-response))))
+                 (sync (handle-evt
+                        (channel-put-evt game-logic (move-y id motion move-response))
+                        (lambda (_)
+                           (channel-get move-response)
+                          'continue))
+                       (handle-evt
+                        game-event
+                        (lambda (_)
+                          #f))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Rendering
@@ -741,7 +782,7 @@
   (define keyboard-driver (start-keyboard-driver key-events))
   (define dc (make-frame key-events 600 400))
   (define renderer (start-renderer dc))
-  (start-level-manager (list level0) game-clock renderer keyboard-driver))
+  (start-level-manager ALL-LEVELS game-clock renderer keyboard-driver))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Level Data
@@ -762,8 +803,7 @@
                (rect (posn 200 178) 50 10)
                (rect (posn 300 150) 50 10))
          GOAL0
-         (lambda (a b) #f)
-         #;(lambda (game-logic game-clock)
+         (lambda (game-logic game-clock)
            (make-horiz-enemy game-logic game-clock 0 180 20 20 130 2)
            (make-horiz-enemy game-logic game-clock 200 158 20 20 30 1)
            (make-horiz-enemy game-logic game-clock 300 130 20 20 30 1)
