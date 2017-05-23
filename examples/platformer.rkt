@@ -317,6 +317,8 @@
     (define (shutdown!)
       (channel-put unsub-timer (unsubscribe))
       (channel-put unsub-keyboard (unsubscribe)))
+    (define listen-for-death
+      (handle-evt kill-player (lambda (_) (shutdown!))))
     (let loop ([left-down? #f]
                [right-down? #f]
                [vy 0])
@@ -331,9 +333,7 @@
           (define vx (- (if right-down? dx 0)
                         (if left-down? dx 0)))
           (sync
-           (handle-evt
-            kill-player
-            (lambda (k) (shutdown!)))
+           listen-for-death
            (handle-evt
             (channel-put-evt
              game-logic
@@ -341,9 +341,7 @@
             (lambda (_)
               (channel-get move-response)
               (sync
-               (handle-evt
-                kill-player
-                (lambda (k) (shutdown!)))
+               listen-for-death
                (handle-evt
                 (channel-put-evt game-logic (move-y player-id vy move-response))
                 (lambda (_)
@@ -357,15 +355,13 @@
         (match-lambda
           [(key-press #\space)
            (sync
-               (handle-evt
-                kill-player
-                (lambda (k) (shutdown!)))
-               (handle-evt
-                (channel-put-evt game-logic (player-can-jump? move-response))
-                (lambda (_)
-                  (match (channel-get move-response)
-                    [(can-jump) (loop left-down? right-down? jump-v)]
-                    [(cannot-jump) (loop left-down? right-down? vy)]))))]
+            listen-for-death
+            (handle-evt
+             (channel-put-evt game-logic (player-can-jump? move-response))
+             (lambda (_)
+               (match (channel-get move-response)
+                 [(can-jump) (loop left-down? right-down? jump-v)]
+                 [(cannot-jump) (loop left-down? right-down? vy)]))))]
           [(key-press 'left)
            (loop #t right-down? vy)]
           [(key-release 'left)
