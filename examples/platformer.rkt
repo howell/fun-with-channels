@@ -87,6 +87,8 @@
 ;;  'level-complete
 ;;  'defeat
 
+(define game-logic-where #f)
+
 ;; (Channelof LevelOver)
 ;; (Channelof Any)
 ;; (Channelof TickSuscription)
@@ -110,12 +112,18 @@
     (channel-put clock-chan (tick-subscription 'game-logic clock-ticks unsub-timer))
     ;; LevelOver (Listof Enemey) -> Void
     (define (shutdown! reason enemies)
+      (set! game-logic-where 1)
       (channel-put kill-player-chan 'DDDDDIEEEE!)
+      (set! game-logic-where 2)
       (channel-put unsub-timer (unsubscribe))
+      (set! game-logic-where 3)
       (for ([e (in-list enemies)])
         (channel-put (enemy-chan e) reason))
-      (channel-put level-over-chan reason))
+      (set! game-logic-where 4)
+      (channel-put level-over-chan reason)
+      (set! game-logic-where #f))
     (let loop ([gs (game-state player0 '() goal0 (hash) level-size)])
+      (set! game-logic-where 0)
       (sync (handle-evt
              clock-ticks
              (lambda (t)
@@ -447,6 +455,8 @@
 (struct tick () #:transparent)
 (struct tick-subscription (name notify-chan unsub-chan) #:transparent)
 
+(define waiting-on #f)
+
 ;; (Channelof SetTimer) Ms -> (Channelof TickSuscription)
 (define (start-game-clock timer-chan frame-period-ms)
   (define request-chan (make-channel))
@@ -475,10 +485,12 @@
                   ([chans (sequence-append (in-list subscribers)
                                            (in-list more-subscribers))])
           (match-define (list name notify-chan unsub-chan) chans)
+          (set! waiting-on name)
           (sync (handle-evt (channel-put-evt notify-chan (tick))
                             (lambda (e) (cons chans subs)))
                 (handle-evt unsub-chan
                             (lambda (e) subs)))))
+      (set! waiting-on #f)
       (loop new-subscribers (+ now frame-period-ms)))))
   request-chan)
 
@@ -545,6 +557,9 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Enemies
 
+(define enemies-where
+  (make-weak-hash))
+
 ;; Number Number Number Number (Natural Id (Channelof GameEvent) -> Boolean) -> PID
 (define (start-enemy game-logic game-clock x0 y0 w h behavior)
   (define id (gensym 'enemy))
@@ -555,18 +570,27 @@
     (define game-event (make-channel))
     (channel-put game-clock (tick-subscription id clock-tick unsub-timer))
     (channel-put game-logic (make-enemy id (rect (posn x0 y0) w h) game-event))
+    (define where-am-I (box #f))
+    (hash-set! enemies-where id where-am-I)
     (let loop ([n 0])
+      (set-box! where-am-I 1)
       (sync
        (handle-evt
         clock-tick
         (lambda (t)
-          (if (behavior n id game-event)
-              (loop (add1 n))
-              (channel-put unsub-timer (unsubscribe)))))
+          (set-box! where-am-I 2)
+          (cond
+            [(behavior n id game-event)
+             (loop (add1 n))]
+            [else
+             (set-box! where-am-I 3)
+             (channel-put unsub-timer (unsubscribe))])))
        (handle-evt
         game-event
         (lambda (_)
-          (channel-put unsub-timer (unsubscribe)))))))))
+          (set-box! where-am-I 4)
+          (channel-put unsub-timer (unsubscribe))
+          (set-box! where-am-I #f))))))))
 
 ;; spawn an enemy that travels from (x0, y0) to (x0 + x-dist, y0) then back to
 ;; (x0, y0) at a rate of dx per clock tick
