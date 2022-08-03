@@ -1,0 +1,100 @@
+
+Deadlock scenario 1: Caused by Player not listening on levelOverCh when sending a command over moveRequestCh.
+Sequence of Events:
+<Timer Fires>
+Clock sends Tick to GameLogic
+GameLogic receives Tick from Clock
+Clock send Tick to Player
+Player receives Tick from Clock
+Player sends MovePlayer to GameLogic
+GameLogic receives MovePlayer from Player
+GameLogic sends Ok to Player
+Player receives Ok from GameLogic
+~~ the player is dead! GameLogic exits the loop
+<Timer Fires>
+Clock sends Tick to Player
+Player receives Tick from Clock
+Player sends MovePlayer to GameLogic
+GameLogic sends LevelOver to Player
+~~ deadlock
+
+Deadlock scenario 2: Caused by GameLogic sending Unsubscribe to Clock before sending LevelOver to Player.
+Sequence of Events:
+<Timer Fires>
+Clock sends Tick to GameLogic
+GameLogic receives Tick from Clock
+Clock send Tick to Player
+Player receives Tick from Clock
+Player sends MovePlayer to GameLogic
+GameLogic receives MovePlayer from Player
+GameLogic sends Ok to Player
+Player receives Ok from GameLogic
+~~ the player is dead! GameLogic exits the loop
+<Timer Fires>
+Clock sends Tick to Player
+Player receives Tick from Clock
+Player sends MovePlayer to GameLogic
+GameLogic sends Unsubscribe to Clock
+~~ deadlock
+
+
+;; buggy! not listening on levelOverCh when sending on moveRequestCh
+def Player(keyEventCh, moveRequestCh, levelOverCh, clockCh):
+  tickCh := new Channel()
+  unsubCh := new Channel()
+  moveResponseCh = new Channel()
+  clockCh <- Subscribe(tickCh, unsubCh)
+  dx := 0, dy := 0
+  continue := True
+  while continue
+    sync keyEventCh -> ke {
+           dx := ...
+           dy := ...
+         }
+         tickCh -> _ {
+           moveRequestCh <- MovePlayer(dx, dy, moveResponseCh)
+           if moveResponseCh.get() == YCollision
+             dy := 0
+         }
+         levelOverCh -> _ {
+           continue := False
+         }
+  unsubCh <- Unsubscribe
+
+
+def GameLogic(moveRequestCh, clockCh, levelOverCh, renderCh):
+  tickCh := new Channel()
+  unsubCh := new Channel()
+  clockCh <- Subscribe(tickCh, unsubCh)
+  currentState := GameState(...)
+  continue := True
+  while continue
+    sync tickCh -> _ {
+           renderCh <- currentState
+         }
+         moveRequestCh -> MovePlayer(dx, dy, responseCh) {
+           currentState, yCollision := simulatePhysics(currentState, dx, dy)
+           if yCollision
+             responseCh <- YCollision
+           else
+             responseCh <- Ok
+           if currentState.gameOver()
+             continue := False
+         }
+  unsubCh <- Unsubscribe
+  levelOverCh <- levelOver
+
+def GameClock(subscribeCh, timerCh, period)
+  subscribers := []
+  timerElapsedCh := new Channel()
+  while True
+    timerCh <- SetTimer(Now() + period, timerElapsedCh)
+    timerElapsedCh.get()
+    while subscribeCh.getReady()
+      Subscribe(tickCh, unsubCh) = subscribeCh.get()
+      subscribers := [(tickCh, unsubCh)] ++ subscribers
+    for (tickCh, unsubCh) in subscribers
+      sync tickCh.put(Tick) -> {}
+           unsubCh -> _ {
+             subscribers.remove((tickCh,unsubCh))
+           }
